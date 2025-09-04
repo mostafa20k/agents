@@ -18,6 +18,7 @@ import asyncio
 import io
 import struct
 import threading
+import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import cast
@@ -153,6 +154,11 @@ class AudioStreamDecoder:
             self.__class__._executor = ThreadPoolExecutor(max_workers=self.__class__._max_workers)
 
     def push(self, chunk: bytes) -> None:
+        """Push a chunk of audio data. This chunk is treated as a complete, self-contained audio stream (e.g., an MP3 file)."""
+        if self._closed:
+             logger.warning("Attempted to push data to a closed AudioStreamDecoder.")
+             return
+
         self._input_buf.write(chunk)
         if not self._started:
             self._started = True
@@ -160,29 +166,37 @@ class AudioStreamDecoder:
             self._loop.run_in_executor(self.__class__._executor, target)
 
     def end_input(self) -> None:
+        """Signal the end of the current audio stream data."""
         self._input_buf.end_input()
         if not self._started:
-            # if no data was pushed, close the output channel
+            # if no data was ever pushed, close the output channel immediately
             self._output_ch.close()
 
     def _decode_loop(self) -> None:
+        """Decodes the audio stream from the buffer. Assumes the buffer contains a complete stream."""
         container: av.container.InputContainer | None = None
         resampler: av.AudioResampler | None = None
         try:
             # open container in low-latency streaming mode
+            # These options are tuned for receiving complete, small streams (like MP3 chunks)
             container = av.open(
                 self._input_buf,
                 mode="r",
                 format=self._av_format,
-                buffer_size=256,
+                # buffer_size=256, # Default is usually fine
                 options={
+                    # Very small probesize/analyzeduration for quick detection of tiny streams
                     "probesize": "32",
                     "analyzeduration": "0",
+                    # Flags to reduce latency and buffering
                     "fflags": "nobuffer+flush_packets",
                     "flags": "low_delay",
                     "reorder_queue_size": "0",
                     "max_delay": "0",
                     "avioflags": "direct",
+                    # Do not fail on minor errors, just skip bad packets
+                    # Note: err_detect option string value depends on FFmpeg version, 'ignore_err' is common.
+                    "err_detect": "ignore_err",
                 },
             )
             # explicitly disable internal buffering flags on the FFmpeg container
@@ -194,6 +208,9 @@ class AudioStreamDecoder:
                 raise ValueError("no audio stream found")
 
             audio_stream = container.streams.audio[0]
+            
+            # Note: Removed the line causing AttributeError
+            # audio_stream.codec_context.err_recognition = av.codec.context.ErrRecognition.IGNORE_ERR
 
             # Set up resampler only if needed
             if self._sample_rate is not None or self._layout is not None:
@@ -201,30 +218,48 @@ class AudioStreamDecoder:
                     format="s16", layout=self._layout, rate=self._sample_rate
                 )
 
-            for frame in container.decode(audio_stream):
+            # Demux and decode all packets in this stream
+            for packet in container.demux(audio_stream):
                 if self._closed:
-                    return
+                    return # Stop if decoder is closed externally
 
-                if resampler:
-                    frames = resampler.resample(frame)
-                else:
-                    frames = [frame]
+                if packet.size == 0:
+                    continue # Skip empty packets
 
-                for f in frames:
-                    nchannels = len(f.layout.channels)
-                    self._loop.call_soon_threadsafe(
-                        self._output_ch.send_nowait,
-                        rtc.AudioFrame(
-                            data=f.to_ndarray().tobytes(),
-                            num_channels=nchannels,
-                            sample_rate=int(f.sample_rate),
-                            samples_per_channel=int(f.samples / nchannels),
-                        ),
-                    )
+                try:
+                    decoded_frames = audio_stream.decode(packet)
+                except av.InvalidDataError:
+                    logger.warning("skipping invalid audio packet")
+                    continue
+
+                for frame in decoded_frames:
+                    if self._closed:
+                        return # Stop if decoder is closed externally
+
+                    if resampler:
+                        resampled_frames = resampler.resample(frame) or []
+                    else:
+                        resampled_frames = [frame]
+
+                    for f in resampled_frames:
+                        nchannels = len(f.layout.channels)
+                        # Schedule sending the frame back to the asyncio loop
+                        self._loop.call_soon_threadsafe(
+                            self._output_ch.send_nowait,
+                            rtc.AudioFrame(
+                                data=f.to_ndarray().tobytes(),
+                                num_channels=nchannels,
+                                sample_rate=int(f.sample_rate),
+                                samples_per_channel=int(f.samples / nchannels),
+                            ),
+                        )
 
         except Exception:
             logger.exception("error decoding audio")
         finally:
+            # This specific run of _decode_loop is finished.
+            # Signal the end of this stream's output on the channel.
+            # The decoder instance itself is not closed, but this stream is.
             self._loop.call_soon_threadsafe(self._output_ch.close)
             if container:
                 container.close()
@@ -234,7 +269,8 @@ class AudioStreamDecoder:
 
         This can be much faster than using ffmpeg, as we are emitting frames as quickly as possible.
         """
-
+        # This function remains largely unchanged from your second version,
+        # as it correctly handles its own stream format.
         try:
             # parse RIFF header
             header = b""
@@ -328,15 +364,24 @@ class AudioStreamDecoder:
         return await self._output_ch.__anext__()
 
     async def aclose(self) -> None:
+        """Close the decoder permanently."""
         if self._closed:
             return
 
         self.end_input()
         self._closed = True
-        self._input_buf.close()
+        self._input_buf.close() # Close the buffer
 
+    
         if not self._started:
-            return
+             self._output_ch.close()
+             return
 
-        async for _ in self._output_ch:
+        # If started, wait for the channel to be closed by the executor task.
+        # This prevents "asyncio.Queue.get_nowait() is forbidden" errors if
+        # the channel is closed while someone is waiting on it.
+        try:
+            async for _ in self._output_ch:
+                pass # Consume any remaining items until channel is closed
+        except: # Channel might already be closed, ignore errors here
             pass
