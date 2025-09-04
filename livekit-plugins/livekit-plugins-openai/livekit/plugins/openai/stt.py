@@ -15,235 +15,183 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
-import os
 import time
-import weakref
-from dataclasses import dataclass
-from typing import Any
-from urllib.parse import urlencode
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterable, AsyncIterator
+from dataclasses import dataclass, field
+from enum import Enum, unique
+from types import TracebackType
+from typing import Generic, Literal, TypeVar, Union
 
-import aiohttp
-import httpx
+from pydantic import BaseModel, ConfigDict, Field
 
-import openai
 from livekit import rtc
-from livekit.agents import (
-    DEFAULT_API_CONNECT_OPTIONS,
-    APIConnectionError,
-    APIConnectOptions,
-    APIStatusError,
-    APITimeoutError,
-    stt,
-    utils,
-)
-from livekit.agents.types import (
-    NOT_GIVEN,
-    NotGivenOr,
-)
-from livekit.agents.utils import AudioBuffer, is_given
-from openai.types.audio import TranscriptionVerbose
-from openai.types.beta.realtime.transcription_session_update_param import (
-    SessionTurnDetection,
-)
 
-from .log import logger
-from .models import GroqAudioModels, STTModels
-from .utils import AsyncAzureADTokenProvider
+from .._exceptions import APIConnectionError, APIError
+from ..log import logger
+from ..metrics import STTMetrics
+from ..types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, APIConnectOptions, NotGivenOr
+from ..utils import AudioBuffer, aio, is_given
+from ..utils.audio import calculate_audio_duration
 
-# OpenAI Realtime API has a timeout of 15 mins, we'll attempt to restart the session
-# before that timeout is reached
-_max_session_duration = 10 * 60
-# emit interim transcriptions every 0.5 seconds
-_delta_transcript_interval = 0.5
-SAMPLE_RATE = 24000
-NUM_CHANNELS = 1
+
+@unique
+class SpeechEventType(str, Enum):
+    START_OF_SPEECH = "start_of_speech"
+    """indicate the start of speech
+    if the STT doesn't support this event, this will be emitted as the same time as the first INTERIM_TRANSCRIPT"""  # noqa: E501
+    INTERIM_TRANSCRIPT = "interim_transcript"
+    """interim transcript, useful for real-time transcription"""
+    FINAL_TRANSCRIPT = "final_transcript"
+    """final transcript, emitted when the STT is confident enough that a certain
+    portion of speech will not change"""
+    RECOGNITION_USAGE = "recognition_usage"
+    """usage event, emitted periodically to indicate usage metrics"""
+    END_OF_SPEECH = "end_of_speech"
+    """indicate the end of speech, emitted when the user stops speaking"""
 
 
 @dataclass
-class _STTOptions:
-    model: STTModels | str
+class SpeechData:
     language: str
-    detect_language: bool
-    turn_detection: SessionTurnDetection
-    prompt: NotGivenOr[str] = NOT_GIVEN
-    noise_reduction_type: NotGivenOr[str] = NOT_GIVEN
+    text: str
+    start_time: float = 0.0
+    end_time: float = 0.0
+    confidence: float = 0.0  # [0, 1]
+    speaker_id: str | None = None
 
 
-class STT(stt.STT):
-    def __init__(
+@dataclass
+class RecognitionUsage:
+    audio_duration: float
+
+
+@dataclass
+class SpeechEvent:
+    type: SpeechEventType
+    request_id: str = ""
+    alternatives: list[SpeechData] = field(default_factory=list)
+    recognition_usage: RecognitionUsage | None = None
+
+
+@dataclass
+class STTCapabilities:
+    streaming: bool
+    interim_results: bool
+
+
+class STTError(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    type: Literal["stt_error"] = "stt_error"
+    timestamp: float
+    label: str
+    error: Exception = Field(..., exclude=True)
+    recoverable: bool
+
+
+TEvent = TypeVar("TEvent")
+
+
+class STT(
+    ABC,
+    rtc.EventEmitter[Union[Literal["metrics_collected", "error"], TEvent]],
+    Generic[TEvent],
+):
+    def __init__(self, *, capabilities: STTCapabilities) -> None:
+        super().__init__()
+        self._capabilities = capabilities
+        self._label = f"{type(self).__module__}.{type(self).__name__}"
+
+    @property
+    def label(self) -> str:
+        return self._label
+
+    @property
+    def capabilities(self) -> STTCapabilities:
+        return self._capabilities
+
+    @abstractmethod
+    async def _recognize_impl(
         self,
+        buffer: AudioBuffer,
         *,
-        language: str = "en",
-        detect_language: bool = False,
-        model: STTModels | str = "gpt-4o-mini-transcribe",
-        prompt: NotGivenOr[str] = NOT_GIVEN,
-        turn_detection: NotGivenOr[SessionTurnDetection] = NOT_GIVEN,
-        noise_reduction_type: NotGivenOr[str] = NOT_GIVEN,
-        base_url: NotGivenOr[str] = NOT_GIVEN,
-        api_key: NotGivenOr[str] = NOT_GIVEN,
-        client: openai.AsyncClient | None = None,
-        use_realtime: bool = False,
-    ):
-        """
-        Create a new instance of OpenAI STT.
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions,
+    ) -> SpeechEvent: ...
 
-        Args:
-            language: The language code to use for transcription (e.g., "en" for English).
-            detect_language: Whether to automatically detect the language.
-            model: The OpenAI model to use for transcription.
-            prompt: Optional text prompt to guide the transcription. Only supported for whisper-1.
-            turn_detection: When using realtime transcription, this controls how model detects the user is done speaking.
-                Final transcripts are generated only after the turn is over. See: https://platform.openai.com/docs/guides/realtime-vad
-            noise_reduction_type: Type of noise reduction to apply. "near_field" or "far_field"
-                This isn't needed when using LiveKit's noise cancellation.
-            base_url: Custom base URL for OpenAI API.
-            api_key: Your OpenAI API key. If not provided, will use the OPENAI_API_KEY environment variable.
-            client: Optional pre-configured OpenAI AsyncClient instance.
-            use_realtime: Whether to use the realtime transcription API. (default: False)
-        """  # noqa: E501
+    async def recognize(
+        self,
+        buffer: AudioBuffer,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> SpeechEvent:
+        for i in range(conn_options.max_retry + 1):
+            try:
+                start_time = time.perf_counter()
+                event = await self._recognize_impl(
+                    buffer, language=language, conn_options=conn_options
+                )
+                duration = time.perf_counter() - start_time
+                stt_metrics = STTMetrics(
+                    request_id=event.request_id,
+                    timestamp=time.time(),
+                    duration=duration,
+                    label=self._label,
+                    audio_duration=calculate_audio_duration(buffer),
+                    streamed=False,
+                )
+                end_time = time.perf_counter()
+                duration = end_time - start_time
+                audio_dur = calculate_audio_duration(buffer)
+                rtf = duration / audio_dur if audio_dur > 0 else 0.0
+                logger.info(
+                f"STT start={start_time:.4f} end={end_time:.4f} "
+                f"duration={duration:.4f}s audio_dur={audio_dur:.4f}s RTF={rtf:.3f}"
+                )
 
-        super().__init__(
-            capabilities=stt.STTCapabilities(streaming=use_realtime, interim_results=use_realtime)
-        )
-        if detect_language:
-            language = ""
+                # self.emit("metrics_collected", stt_metrics)
+                return event
 
-        if not is_given(turn_detection):
-            turn_detection = {
-                "type": "server_vad",
-                "threshold": 0.5,
-                "prefix_padding_ms": 600,
-                "silence_duration_ms": 350,
-            }
+            except APIError as e:
+                retry_interval = conn_options._interval_for_retry(i)
+                if conn_options.max_retry == 0:
+                    self._emit_error(e, recoverable=False)
+                    raise
+                elif i == conn_options.max_retry:
+                    self._emit_error(e, recoverable=False)
+                    raise APIConnectionError(
+                        f"failed to recognize speech after {conn_options.max_retry + 1} attempts",
+                    ) from e
+                else:
+                    self._emit_error(e, recoverable=True)
+                    logger.warning(
+                        f"failed to recognize speech, retrying in {retry_interval}s",
+                        exc_info=e,
+                        extra={
+                            "tts": self._label,
+                            "attempt": i + 1,
+                            "streamed": False,
+                        },
+                    )
 
-        self._opts = _STTOptions(
-            language=language,
-            detect_language=detect_language,
-            model=model,
-            prompt=prompt,
-            turn_detection=turn_detection,
-        )
-        if is_given(noise_reduction_type):
-            self._opts.noise_reduction_type = noise_reduction_type
+                await asyncio.sleep(retry_interval)
 
-        self._client = client or openai.AsyncClient(
-            max_retries=0,
-            api_key=api_key if is_given(api_key) else None,
-            base_url=base_url if is_given(base_url) else None,
-            http_client=httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=15.0, read=5.0, write=5.0, pool=5.0),
-                follow_redirects=True,
-                limits=httpx.Limits(
-                    max_connections=50,
-                    max_keepalive_connections=50,
-                    keepalive_expiry=120,
-                ),
+            except Exception as e:
+                self._emit_error(e, recoverable=False)
+                raise
+
+        raise RuntimeError("unreachable")
+
+    def _emit_error(self, api_error: Exception, recoverable: bool) -> None:
+        self.emit(
+            "error",
+            STTError(
+                timestamp=time.time(),
+                label=self._label,
+                error=api_error,
+                recoverable=recoverable,
             ),
-        )
-
-        self._streams = weakref.WeakSet[SpeechStream]()
-        self._session: aiohttp.ClientSession | None = None
-        self._pool = utils.ConnectionPool[aiohttp.ClientWebSocketResponse](
-            max_session_duration=_max_session_duration,
-            connect_cb=self._connect_ws,
-            close_cb=self._close_ws,
-        )
-
-    @staticmethod
-    def with_azure(
-        *,
-        language: str = "en",
-        detect_language: bool = False,
-        model: STTModels | str = "gpt-4o-mini-transcribe",
-        prompt: NotGivenOr[str] = NOT_GIVEN,
-        turn_detection: NotGivenOr[SessionTurnDetection] = NOT_GIVEN,
-        noise_reduction_type: NotGivenOr[str] = NOT_GIVEN,
-        azure_endpoint: str | None = None,
-        azure_deployment: str | None = None,
-        api_version: str | None = None,
-        api_key: str | None = None,
-        azure_ad_token: str | None = None,
-        azure_ad_token_provider: AsyncAzureADTokenProvider | None = None,
-        organization: str | None = None,
-        project: str | None = None,
-        base_url: str | None = None,
-        use_realtime: bool = False,
-        timeout: httpx.Timeout | None = None,
-    ) -> STT:
-        """
-        Create a new instance of Azure OpenAI STT.
-
-        This automatically infers the following arguments from their corresponding environment variables if they are not provided:
-        - `api_key` from `AZURE_OPENAI_API_KEY`
-        - `organization` from `OPENAI_ORG_ID`
-        - `project` from `OPENAI_PROJECT_ID`
-        - `azure_ad_token` from `AZURE_OPENAI_AD_TOKEN`
-        - `api_version` from `OPENAI_API_VERSION`
-        - `azure_endpoint` from `AZURE_OPENAI_ENDPOINT`
-        """  # noqa: E501
-
-        azure_client = openai.AsyncAzureOpenAI(
-            max_retries=0,
-            azure_endpoint=azure_endpoint,
-            azure_deployment=azure_deployment,
-            api_version=api_version,
-            api_key=api_key,
-            azure_ad_token=azure_ad_token,
-            azure_ad_token_provider=azure_ad_token_provider,
-            organization=organization,
-            project=project,
-            base_url=base_url,
-            timeout=timeout
-            if timeout
-            else httpx.Timeout(connect=15.0, read=5.0, write=5.0, pool=5.0),
-        )  # type: ignore
-
-        return STT(
-            language=language,
-            detect_language=detect_language,
-            model=model,
-            prompt=prompt,
-            turn_detection=turn_detection,
-            noise_reduction_type=noise_reduction_type,
-            client=azure_client,
-            use_realtime=use_realtime,
-        )
-
-    @staticmethod
-    def with_groq(
-        *,
-        model: GroqAudioModels | str = "whisper-large-v3-turbo",
-        api_key: NotGivenOr[str] = NOT_GIVEN,
-        base_url: NotGivenOr[str] = NOT_GIVEN,
-        client: openai.AsyncClient | None = None,
-        language: str = "en",
-        detect_language: bool = False,
-        prompt: NotGivenOr[str] = NOT_GIVEN,
-    ) -> STT:
-        """
-        Create a new instance of Groq STT.
-
-        ``api_key`` must be set to your Groq API key, either using the argument or by setting
-        the ``GROQ_API_KEY`` environmental variable.
-        """
-        groq_api_key = api_key if is_given(api_key) else os.environ.get("GROQ_API_KEY")
-        if not groq_api_key:
-            raise ValueError("Groq API key is required")
-
-        if not is_given(base_url):
-            base_url = "https://api.groq.com/openai/v1"
-
-        return STT(
-            model=model,
-            api_key=groq_api_key,
-            base_url=base_url,
-            client=client,
-            language=language,
-            detect_language=detect_language,
-            prompt=prompt,
-            use_realtime=False,
         )
 
     def stream(
@@ -251,306 +199,226 @@ class STT(stt.STT):
         *,
         language: NotGivenOr[str] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-    ) -> SpeechStream:
-        if is_given(language):
-            self._opts.language = language
-        stream = SpeechStream(
-            stt=self,
-            pool=self._pool,
-            conn_options=conn_options,
+    ) -> RecognizeStream:
+        raise NotImplementedError(
+            "streaming is not supported by this STT, please use a different STT or use a StreamAdapter"  # noqa: E501
         )
-        self._streams.add(stream)
-        return stream
 
-    def update_options(
+    async def aclose(self) -> None:
+        """Close the STT, and every stream/requests associated with it"""
+        ...
+
+    async def __aenter__(self) -> STT:
+        return self
+
+    async def __aexit__(
         self,
-        *,
-        model: NotGivenOr[STTModels | GroqAudioModels | str] = NOT_GIVEN,
-        language: NotGivenOr[str] = NOT_GIVEN,
-        detect_language: NotGivenOr[bool] = NOT_GIVEN,
-        prompt: NotGivenOr[str] = NOT_GIVEN,
-        turn_detection: NotGivenOr[SessionTurnDetection] = NOT_GIVEN,
-        noise_reduction_type: NotGivenOr[str] = NOT_GIVEN,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        exc_tb: TracebackType | None,
     ) -> None:
-        """
-        Update the options for the speech stream. Most options are updated at the
-        connection level. SpeechStreams will be recreated when options are updated.
+        await self.aclose()
 
-        Args:
-            language: The language to transcribe in.
-            detect_language: Whether to automatically detect the language.
-            model: The model to use for transcription.
-            prompt: Optional text prompt to guide the transcription. Only supported for whisper-1.
-            turn_detection: When using realtime, this controls how model detects the user is done speaking.
-            noise_reduction_type: Type of noise reduction to apply. "near_field" or "far_field"
-        """  # noqa: E501
-        if is_given(model):
-            self._opts.model = model
-        if is_given(language):
-            self._opts.language = language
-        if is_given(detect_language):
-            self._opts.detect_language = detect_language
-            self._opts.language = ""
-        if is_given(prompt):
-            self._opts.prompt = prompt
-        if is_given(turn_detection):
-            self._opts.turn_detection = turn_detection
-        if is_given(noise_reduction_type):
-            self._opts.noise_reduction_type = noise_reduction_type
-
-        for stream in self._streams:
-            if is_given(language):
-                stream.update_options(language=language)
-
-    async def _connect_ws(self, timeout: float) -> aiohttp.ClientWebSocketResponse:
-        prompt = self._opts.prompt if is_given(self._opts.prompt) else ""
-        realtime_config: dict[str, Any] = {
-            "type": "transcription_session.update",
-            "session": {
-                "input_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": self._opts.model,
-                    "prompt": prompt,
-                },
-                "turn_detection": self._opts.turn_detection,
-            },
-        }
-        if self._opts.language:
-            realtime_config["session"]["input_audio_transcription"]["language"] = (
-                self._opts.language
-            )
-
-        if self._opts.noise_reduction_type:
-            realtime_config["session"]["input_audio_noise_reduction"] = {
-                "type": self._opts.noise_reduction_type
-            }
-
-        query_params: dict[str, str] = {
-            "intent": "transcription",
-        }
-        headers = {
-            "User-Agent": "LiveKit Agents",
-            "Authorization": f"Bearer {self._client.api_key}",
-            "OpenAI-Beta": "realtime=v1",
-        }
-        url = f"{str(self._client.base_url).rstrip('/')}/realtime?{urlencode(query_params)}"
-        if url.startswith("http"):
-            url = url.replace("http", "ws", 1)
-
-        session = self._ensure_session()
-        ws = await asyncio.wait_for(session.ws_connect(url, headers=headers), timeout)
-        await ws.send_json(realtime_config)
-        return ws
-
-    async def _close_ws(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        await ws.close()
-
-    def _ensure_session(self) -> aiohttp.ClientSession:
-        if not self._session:
-            self._session = utils.http_context.http_session()
-
-        return self._session
-
-    async def _recognize_impl(
-        self,
-        buffer: AudioBuffer,
-        *,
-        language: NotGivenOr[str] = NOT_GIVEN,
-        conn_options: APIConnectOptions,
-    ) -> stt.SpeechEvent:
-        try:
-            if is_given(language):
-                self._opts.language = language
-            data = rtc.combine_audio_frames(buffer).to_wav_bytes()
-            prompt = self._opts.prompt if is_given(self._opts.prompt) else openai.NOT_GIVEN
-
-            format = "json"
-            if self._opts.model == "whisper-1":
-                # verbose_json returns language and other details, only supported for whisper-1
-                format = "verbose_json"
-
-            resp = await self._client.audio.transcriptions.create(
-                file=(
-                    "file.wav",
-                    data,
-                    "audio/wav",
-                ),
-                model=self._opts.model,  # type: ignore
-                language=self._opts.language,
-                prompt=prompt,
-                response_format=format,
-                timeout=httpx.Timeout(30, connect=conn_options.timeout),
-            )
-
-            sd = stt.SpeechData(text=resp.text, language=self._opts.language)
-            if isinstance(resp, TranscriptionVerbose) and resp.language:
-                sd.language = resp.language
-
-            return stt.SpeechEvent(
-                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                alternatives=[sd],
-            )
-
-        except openai.APITimeoutError:
-            raise APITimeoutError() from None
-        except openai.APIStatusError as e:
-            raise APIStatusError(
-                e.message, status_code=e.status_code, request_id=e.request_id, body=e.body
-            ) from None
-        except Exception as e:
-            raise APIConnectionError() from e
+    def prewarm(self) -> None:
+        """Pre-warm connection to the STT service"""
+        pass
 
 
-class SpeechStream(stt.SpeechStream):
+class RecognizeStream(ABC):
+    class _FlushSentinel:
+        """Sentinel to mark when it was flushed"""
+
+        pass
+
     def __init__(
         self,
         *,
         stt: STT,
         conn_options: APIConnectOptions,
-        pool: utils.ConnectionPool[aiohttp.ClientWebSocketResponse],
-    ) -> None:
-        super().__init__(stt=stt, conn_options=conn_options, sample_rate=SAMPLE_RATE)
+        sample_rate: NotGivenOr[int] = NOT_GIVEN,
+    ):
+        """
+        Args:
+        sample_rate : int or None, optional
+            The desired sample rate for the audio input.
+            If specified, the audio input will be automatically resampled to match
+            the given sample rate before being processed for Speech-to-Text.
+            If not provided (None), the input will retain its original sample rate.
+        """
+        self._stt = stt
+        self._conn_options = conn_options
+        self._input_ch = aio.Chan[Union[rtc.AudioFrame, RecognizeStream._FlushSentinel]]()
+        self._event_ch = aio.Chan[SpeechEvent]()
 
-        self._pool = pool
-        self._language = stt._opts.language
-        self._request_id = ""
-        self._reconnect_event = asyncio.Event()
+        self._event_aiter, monitor_aiter = aio.itertools.tee(self._event_ch, 2)
+        self._metrics_task = asyncio.create_task(
+            self._metrics_monitor_task(monitor_aiter), name="STT._metrics_task"
+        )
 
-    def update_options(
+        self._num_retries = 0
+        self._task = asyncio.create_task(self._main_task())
+        self._task.add_done_callback(lambda _: self._event_ch.close())
+
+        self._needed_sr = sample_rate if is_given(sample_rate) else None
+        self._pushed_sr = 0
+        self._resampler: rtc.AudioResampler | None = None
+
+    @abstractmethod
+    async def _run(self) -> None: ...
+
+    async def _main_task(self) -> None:
+        max_retries = self._conn_options.max_retry
+
+        while self._num_retries <= max_retries:
+            try:
+                return await self._run()
+            except APIError as e:
+                if max_retries == 0:
+                    self._emit_error(e, recoverable=False)
+                    raise
+                elif self._num_retries == max_retries:
+                    self._emit_error(e, recoverable=False)
+                    raise APIConnectionError(
+                        f"failed to recognize speech after {self._num_retries} attempts",
+                    ) from e
+                else:
+                    self._emit_error(e, recoverable=True)
+
+                    retry_interval = self._conn_options._interval_for_retry(self._num_retries)
+                    logger.warning(
+                        f"failed to recognize speech, retrying in {retry_interval}s",
+                        exc_info=e,
+                        extra={
+                            "tts": self._stt._label,
+                            "attempt": self._num_retries,
+                            "streamed": True,
+                        },
+                    )
+                    await asyncio.sleep(retry_interval)
+
+                self._num_retries += 1
+
+            except Exception as e:
+                self._emit_error(e, recoverable=False)
+                raise
+
+    def _emit_error(self, api_error: Exception, recoverable: bool) -> None:
+        self._stt.emit(
+            "error",
+            STTError(
+                timestamp=time.time(),
+                label=self._stt._label,
+                error=api_error,
+                recoverable=recoverable,
+            ),
+        )
+
+    async def _metrics_monitor_task(self, event_aiter: AsyncIterable[SpeechEvent]) -> None:
+        """Task used to collect metrics"""
+
+        async for ev in event_aiter:
+            if ev.type == SpeechEventType.RECOGNITION_USAGE:
+                assert ev.recognition_usage is not None, (
+                    "recognition_usage must be provided for RECOGNITION_USAGE event"
+                )
+
+                stt_metrics = STTMetrics(
+                    request_id=ev.request_id,
+                    timestamp=time.time(),
+                    duration=0.0,
+                    label=self._stt._label,
+                    audio_duration=ev.recognition_usage.audio_duration,
+                    streamed=True,
+                )
+
+                self._stt.emit("metrics_collected", stt_metrics)
+            elif ev.type == SpeechEventType.FINAL_TRANSCRIPT:
+                # reset the retry count after a successful recognition
+                self._num_retries = 0
+
+    def push_frame(self, frame: rtc.AudioFrame) -> None:
+        """Push audio to be recognized"""
+        self._check_input_not_ended()
+        self._check_not_closed()
+
+        if self._pushed_sr and self._pushed_sr != frame.sample_rate:
+            raise ValueError("the sample rate of the input frames must be consistent")
+
+        self._pushed_sr = frame.sample_rate
+
+        if self._needed_sr and self._needed_sr != frame.sample_rate:
+            if not self._resampler:
+                self._resampler = rtc.AudioResampler(
+                    frame.sample_rate,
+                    self._needed_sr,
+                    quality=rtc.AudioResamplerQuality.HIGH,
+                )
+
+        if self._resampler:
+            frames = self._resampler.push(frame)
+            for frame in frames:
+                self._input_ch.send_nowait(frame)
+        else:
+            self._input_ch.send_nowait(frame)
+
+    def flush(self) -> None:
+        """Mark the end of the current segment"""
+        self._check_input_not_ended()
+        self._check_not_closed()
+
+        if self._resampler:
+            for frame in self._resampler.flush():
+                self._input_ch.send_nowait(frame)
+
+        self._input_ch.send_nowait(self._FlushSentinel())
+
+    def end_input(self) -> None:
+        """Mark the end of input, no more audio will be pushed"""
+        self.flush()
+        self._input_ch.close()
+
+    async def aclose(self) -> None:
+        """Close ths stream immediately"""
+        self._input_ch.close()
+        await aio.cancel_and_wait(self._task)
+
+        if self._metrics_task is not None:
+            await self._metrics_task
+
+    async def __anext__(self) -> SpeechEvent:
+        try:
+            val = await self._event_aiter.__anext__()
+        except StopAsyncIteration:
+            if not self._task.cancelled() and (exc := self._task.exception()):
+                raise exc  # noqa: B904
+
+            raise StopAsyncIteration from None
+
+        return val
+
+    def __aiter__(self) -> AsyncIterator[SpeechEvent]:
+        return self
+
+    def _check_not_closed(self) -> None:
+        if self._event_ch.closed:
+            cls = type(self)
+            raise RuntimeError(f"{cls.__module__}.{cls.__name__} is closed")
+
+    def _check_input_not_ended(self) -> None:
+        if self._input_ch.closed:
+            cls = type(self)
+            raise RuntimeError(f"{cls.__module__}.{cls.__name__} input ended")
+
+    async def __aenter__(self) -> RecognizeStream:
+        return self
+
+    async def __aexit__(
         self,
-        *,
-        language: str,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        exc_tb: TracebackType | None,
     ) -> None:
-        self._language = language
-        self._pool.invalidate()
-        self._reconnect_event.set()
+        await self.aclose()
 
-    @utils.log_exceptions(logger=logger)
-    async def _run(self) -> None:
-        closing_ws = False
 
-        @utils.log_exceptions(logger=logger)
-        async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-            nonlocal closing_ws
-
-            # forward audio to OAI in chunks of 50ms
-            audio_bstream = utils.audio.AudioByteStream(
-                sample_rate=SAMPLE_RATE,
-                num_channels=NUM_CHANNELS,
-                samples_per_channel=SAMPLE_RATE // 20,
-            )
-
-            async for data in self._input_ch:
-                frames: list[rtc.AudioFrame] = []
-                if isinstance(data, rtc.AudioFrame):
-                    frames.extend(audio_bstream.write(data.data.tobytes()))
-                elif isinstance(data, self._FlushSentinel):
-                    frames.extend(audio_bstream.flush())
-
-                for frame in frames:
-                    encoded_frame = {
-                        "type": "input_audio_buffer.append",
-                        "audio": base64.b64encode(frame.data.tobytes()).decode("utf-8"),
-                    }
-                    await ws.send_json(encoded_frame)
-
-            closing_ws = True
-
-        @utils.log_exceptions(logger=logger)
-        async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-            nonlocal closing_ws
-            current_text = ""
-            last_interim_at: float = 0
-            connected_at = time.time()
-            while True:
-                msg = await ws.receive()
-                if msg.type in (
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.CLOSE,
-                    aiohttp.WSMsgType.CLOSING,
-                ):
-                    if closing_ws:  # close is expected, see SpeechStream.aclose
-                        return
-
-                    # this will trigger a reconnection, see the _run loop
-                    raise APIStatusError(
-                        message="OpenAI Realtime STT connection closed unexpectedly"
-                    )
-
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    logger.warning("unexpected OpenAI message type %s", msg.type)
-                    continue
-
-                try:
-                    data = json.loads(msg.data)
-                    msg_type = data.get("type")
-                    if msg_type == "conversation.item.input_audio_transcription.delta":
-                        delta = data.get("delta", "")
-                        if delta:
-                            current_text += delta
-                            if time.time() - last_interim_at > _delta_transcript_interval:
-                                self._event_ch.send_nowait(
-                                    stt.SpeechEvent(
-                                        type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
-                                        alternatives=[
-                                            stt.SpeechData(
-                                                text=current_text,
-                                                language=self._language,
-                                            )
-                                        ],
-                                    )
-                                )
-                                last_interim_at = time.time()
-                    elif msg_type == "conversation.item.input_audio_transcription.completed":
-                        current_text = ""
-                        transcript = data.get("transcript", "")
-                        if transcript:
-                            self._event_ch.send_nowait(
-                                stt.SpeechEvent(
-                                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                                    alternatives=[
-                                        stt.SpeechData(
-                                            text=transcript,
-                                            language=self._language,
-                                        )
-                                    ],
-                                )
-                            )
-                        # restart session if needed
-                        if time.time() - connected_at > _max_session_duration:
-                            logger.info("resetting Realtime STT session due to timeout")
-                            self._pool.remove(ws)
-                            self._reconnect_event.set()
-                            return
-
-                except Exception:
-                    logger.exception("failed to process OpenAI message")
-
-        while True:
-            closing_ws = False  # reset the flag
-            async with self._pool.connection(timeout=self._conn_options.timeout) as ws:
-                tasks = [
-                    asyncio.create_task(send_task(ws)),
-                    asyncio.create_task(recv_task(ws)),
-                ]
-                tasks_group = asyncio.gather(*tasks)
-                wait_reconnect_task = asyncio.create_task(self._reconnect_event.wait())
-                try:
-                    done, _ = await asyncio.wait(
-                        (tasks_group, wait_reconnect_task),
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-
-                    # propagate exceptions from completed tasks
-                    for task in done:
-                        if task != wait_reconnect_task:
-                            task.result()
-
-                    if wait_reconnect_task not in done:
-                        break
-
-                    self._reconnect_event.clear()
-                finally:
-                    await utils.aio.gracefully_cancel(*tasks, wait_reconnect_task)
-                    tasks_group.cancel()
-                    tasks_group.exception()  # retrieve the exception
+SpeechStream = RecognizeStream  # deprecated alias
